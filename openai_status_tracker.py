@@ -1,34 +1,25 @@
 """
-OpenAI Status Page Tracker
-===========================
+OpenAI Status Tracker
+======================
 Monitors the OpenAI status Atom feed for new incidents, outages, and degradations.
+Exposes a lightweight HTTP server so Railway can assign a public URL.
 
-Design philosophy:
-  - Uses the Atom feed (https://status.openai.com/history.atom) — a standard,
-    push-friendly, cacheable format that avoids parsing raw HTML.
-  - Respects HTTP caching headers (ETag / Last-Modified) so the server only
-    sends a full payload when something has actually changed. This makes it
-    safe and efficient even when monitoring 100+ status pages simultaneously.
-  - Maintains an in-memory set of seen entry IDs so duplicate alerts are never
-    printed within a single run.
-  - Extracts the affected product/component from the entry title or body using
-    a lightweight keyword match against known OpenAI API products.
-
-Usage:
-  python openai_status_tracker.py [--interval SECONDS]
-
-Requirements:
-  pip install feedparser requests
+Visit /         → live dashboard (auto-refreshes every 30s)
+Visit /logs     → raw JSON of all captured events
+Visit /health   → health check
 """
 
-import argparse
+import os
+import re
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
 import feedparser
 import requests
+from flask import Flask, jsonify
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -36,54 +27,43 @@ import requests
 
 FEED_URL = "https://status.openai.com/history.atom"
 
-# Known OpenAI API products to extract from incident text.
-# Extend this list as OpenAI adds new products.
 KNOWN_PRODUCTS = [
-    "Chat Completions",
-    "Responses API",
-    "Completions",
-    "Embeddings",
-    "Fine-tuning",
-    "Images",
-    "Audio",
-    "Assistants",
-    "Batch API",
-    "Files API",
-    "Moderation",
-    "Realtime API",
-    "Vector Stores",
-    "Code Interpreter",
-    "Function Calling",
-    "Structured Outputs",
-    "OpenAI API",
+    "Chat Completions", "Responses API", "Completions", "Embeddings",
+    "Fine-tuning", "Images", "Audio", "Assistants", "Batch API",
+    "Files API", "Moderation", "Realtime API", "Vector Stores",
+    "Code Interpreter", "Function Calling", "Structured Outputs", "OpenAI API",
 ]
 
-# Incident-related keywords; entries without these are skipped (e.g. maintenance notices).
 INCIDENT_KEYWORDS = [
-    "incident",
-    "outage",
-    "degraded",
-    "degradation",
-    "disruption",
-    "partial",
-    "investigating",
-    "identified",
-    "monitoring",
-    "resolved",
-    "update",
-    "elevated",
-    "error",
-    "latency",
-    "unavailable",
-    "down",
-    "failure",
+    "incident", "outage", "degraded", "degradation", "disruption",
+    "partial", "investigating", "identified", "monitoring", "resolved",
+    "update", "elevated", "error", "latency", "unavailable", "down", "failure",
 ]
 
-DEFAULT_POLL_INTERVAL = 60  # seconds
+DEFAULT_POLL_INTERVAL = 60
+
+# ---------------------------------------------------------------------------
+# Shared in-memory log
+# ---------------------------------------------------------------------------
+
+_log_lock = threading.Lock()
+_incident_log: list[dict] = []
+
+
+def _append_log(entry: dict):
+    with _log_lock:
+        _incident_log.append(entry)
+        if len(_incident_log) > 500:
+            _incident_log.pop(0)
+
+
+def _read_log() -> list[dict]:
+    with _log_lock:
+        return list(_incident_log)
 
 
 # ---------------------------------------------------------------------------
-# Feed fetching with HTTP conditional requests (ETag / Last-Modified)
+# Feed tracker
 # ---------------------------------------------------------------------------
 
 class FeedTracker:
@@ -94,94 +74,121 @@ class FeedTracker:
         self._etag: str | None = None
         self._last_modified: str | None = None
         self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": "OpenAIStatusTracker/1.0 (+https://github.com/your-org/openai-status-tracker)"
-        })
+        self._session.headers.update({"User-Agent": "OpenAIStatusTracker/1.0"})
 
-    def _fetch_feed(self) -> feedparser.FeedParserDict | None:
-        """
-        Fetch the Atom feed using conditional GET.
-        Returns a parsed feed or None if the server signals 304 Not Modified.
-        """
+    def _fetch_feed(self):
         headers = {}
         if self._etag:
             headers["If-None-Match"] = self._etag
         if self._last_modified:
             headers["If-Modified-Since"] = self._last_modified
-
         try:
-            response = self._session.get(self.url, headers=headers, timeout=15)
+            r = self._session.get(self.url, headers=headers, timeout=15)
         except requests.RequestException as exc:
-            print(f"[{_now()}] ERROR: Could not reach {self.url} — {exc}", file=sys.stderr)
+            print(f"[{_now()}] ERROR: {exc}", file=sys.stderr)
             return None
-
-        if response.status_code == 304:
-            # Server confirms nothing changed; no work to do.
+        if r.status_code == 304:
             return None
-
-        if response.status_code != 200:
-            print(
-                f"[{_now()}] ERROR: Unexpected HTTP {response.status_code} from {self.url}",
-                file=sys.stderr,
-            )
+        if r.status_code != 200:
+            print(f"[{_now()}] ERROR: HTTP {r.status_code}", file=sys.stderr)
             return None
-
-        # Cache validators for the next request
-        self._etag = response.headers.get("ETag")
-        self._last_modified = response.headers.get("Last-Modified")
-
-        return feedparser.parse(response.text)
+        self._etag = r.headers.get("ETag")
+        self._last_modified = r.headers.get("Last-Modified")
+        return feedparser.parse(r.text)
 
     def check(self):
-        """Fetch and process new entries, printing alerts for new incidents."""
         feed = self._fetch_feed()
         if feed is None:
-            return  # 304 Not Modified or transient error
-
+            return
         new_entries = [e for e in feed.entries if e.get("id") not in self._seen_ids]
-
-        # Process oldest-first so the console log is chronological
         for entry in reversed(new_entries):
-            entry_id = entry.get("id", "")
-            self._seen_ids.add(entry_id)
+            self._seen_ids.add(entry.get("id", ""))
             self._process_entry(entry)
 
-    def _process_entry(self, entry: feedparser.util.FeedParserDict):
-        """Decide if an entry is incident-related and, if so, print a formatted alert."""
-        title: str = entry.get("title", "")
-        # feedparser normalises content into entry.summary or entry.content[0].value
-        body: str = entry.get("summary", "")
+    def _process_entry(self, entry):
+        title = entry.get("title", "")
+        body = entry.get("summary", "")
         if not body and entry.get("content"):
             body = entry["content"][0].get("value", "")
-
-        combined_text = f"{title} {body}".lower()
-
-        # Skip entries that look like routine maintenance or informational posts
-        if not any(kw in combined_text for kw in INCIDENT_KEYWORDS):
+        combined = f"{title} {body}".lower()
+        if not any(kw in combined for kw in INCIDENT_KEYWORDS):
             return
-
         product = _extract_product(title, body)
         timestamp = _entry_timestamp(entry)
         status_message = _clean_html(body) or title
-
-        print(
-            f"[{timestamp}] Product: {product}\n"
-            f"Status: {status_message}\n"
-            f"{'─' * 60}"
-        )
+        record = {"timestamp": timestamp, "product": product, "status": status_message}
+        _append_log(record)
+        print(f"[{timestamp}] Product: {product}\nStatus: {status_message}\n{'─'*60}")
 
     def run(self):
-        """Blocking event loop. Ctrl-C to stop."""
-        print(f"[{_now()}] Starting OpenAI Status Tracker (polling every {self.poll_interval}s)")
-        print(f"[{_now()}] Feed: {self.url}")
-        print("─" * 60)
-
-        # Do the first check immediately
+        print(f"[{_now()}] Tracker started — polling every {self.poll_interval}s")
         self.check()
-
         while True:
             time.sleep(self.poll_interval)
             self.check()
+
+
+# ---------------------------------------------------------------------------
+# Flask web server
+# ---------------------------------------------------------------------------
+
+app = Flask(__name__)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "feed": FEED_URL}), 200
+
+
+@app.route("/logs")
+def logs_json():
+    return jsonify(_read_log()), 200
+
+
+@app.route("/")
+def dashboard():
+    entries = _read_log()
+    rows_html = ""
+    if entries:
+        for e in reversed(entries):
+            rows_html += f"""
+            <div class="card">
+              <div class="meta">
+                <span class="product">{e['product']}</span>
+                <span class="ts">{e['timestamp']} UTC</span>
+              </div>
+              <div class="status">{e['status']}</div>
+            </div>"""
+    else:
+        rows_html = '<p class="empty">No incidents detected yet. Checking every 60s…</p>'
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>OpenAI Status Tracker</title>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d0d;color:#e8e8e8;padding:2rem}}
+    h1{{font-size:1.4rem;font-weight:600;margin-bottom:.25rem}}
+    .subtitle{{font-size:.85rem;color:#666;margin-bottom:2rem}}
+    .card{{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:1rem 1.25rem;margin-bottom:1rem}}
+    .meta{{display:flex;justify-content:space-between;margin-bottom:.5rem}}
+    .product{{font-weight:600;color:#10a37f;font-size:.9rem}}
+    .ts{{font-size:.8rem;color:#555}}
+    .status{{font-size:.9rem;color:#ccc;line-height:1.5}}
+    .empty{{color:#555;font-size:.9rem}}
+    .badge{{display:inline-block;background:#10a37f22;color:#10a37f;border-radius:4px;padding:2px 8px;font-size:.75rem;margin-left:.5rem;vertical-align:middle}}
+  </style>
+</head>
+<body>
+  <h1>OpenAI Status Tracker <span class="badge">LIVE</span></h1>
+  <p class="subtitle">Auto-refreshes every 30s &nbsp;·&nbsp; {len(entries)} event(s) captured</p>
+  {rows_html}
+</body>
+</html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -192,20 +199,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _entry_timestamp(entry: feedparser.util.FeedParserDict) -> str:
-    """Return a human-readable UTC timestamp from the feed entry."""
+def _entry_timestamp(entry) -> str:
     ts = entry.get("updated_parsed") or entry.get("published_parsed")
     if ts:
-        dt = datetime(*ts[:6], tzinfo=timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return datetime(*ts[:6], tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     return _now()
 
 
 def _extract_product(title: str, body: str) -> str:
-    """
-    Return the first matching known product name found in the title or body,
-    falling back to a generic label.
-    """
     combined = f"{title} {body}"
     for product in KNOWN_PRODUCTS:
         if product.lower() in combined.lower():
@@ -214,42 +215,23 @@ def _extract_product(title: str, body: str) -> str:
 
 
 def _clean_html(raw: str) -> str:
-    """
-    Very lightweight HTML tag stripper — avoids a BeautifulSoup dependency.
-    Only used for console display; a more robust parser could be added.
-    """
-    import re
     text = re.sub(r"<[^>]+>", " ", raw)
     text = re.sub(r"\s+", " ", text).strip()
-    # Truncate to keep console output readable
-    return text[:300] + ("…" if len(text) > 300 else "")
+    return text[:400] + ("…" if len(text) > 400 else "")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _handle_sigint(_sig, _frame):
-    print(f"\n[{_now()}] Tracker stopped.")
-    sys.exit(0)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Track OpenAI status page incidents via Atom feed.")
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=DEFAULT_POLL_INTERVAL,
-        metavar="SECONDS",
-        help=f"How often to poll the feed (default: {DEFAULT_POLL_INTERVAL}s)",
-    )
-    args = parser.parse_args()
-
-    signal.signal(signal.SIGINT, _handle_sigint)
-
-    tracker = FeedTracker(FEED_URL, args.interval)
-    tracker.run()
-
-
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    interval = int(os.environ.get("POLL_INTERVAL", DEFAULT_POLL_INTERVAL))
+    tracker = FeedTracker(FEED_URL, interval)
+    t = threading.Thread(target=tracker.run, daemon=True)
+    t.start()
+
+    port = int(os.environ.get("PORT", 8080))
+    print(f"[{_now()}] Web server starting on port {port}")
+    app.run(host="0.0.0.0", port=port)
